@@ -33,6 +33,8 @@ public class MobileHomeStateContractTest {
     private static final String LAYOUT = "app/src/mobile/res/layout/fragment_vod.xml";
     private static final String STRINGS = "app/src/main/res/values/strings.xml";
     private static final String STRINGS_CN = "app/src/main/res/values-zh-rCN/strings.xml";
+    private static final String BASE_CONFIG = "app/src/main/java/com/fongmi/android/tv/api/config/BaseConfig.java";
+    private static final String CALLBACK = "app/src/main/java/com/fongmi/android/tv/impl/Callback.java";
 
     @Test
     public void stateEventCarriesAFailureReasonAndAnErrorType() throws Exception {
@@ -138,6 +140,68 @@ public class MobileHomeStateContractTest {
         // 它只负责画状态，不承载内容子视图。
         int at = layout.indexOf("@+id/state");
         assertTrue("状态浮层必须默认隐藏", layout.indexOf("android:visibility=\"gone\"", at) > 0);
+    }
+
+    /**
+     * 「还没配接口」必须与「加载失败」分开：前者不是失败。
+     *
+     * <p>重置应用、重装或恢复出厂后的首次启动就是这个状态。改动前 {@code BaseConfig} 把它
+     * 当成 {@code error("")} 抛出来，首页显示「内容源加载失败 / 重试」——一个不存在的故障
+     * 加一个点了永远没用的按钮（用户实机截图确认）。
+     */
+    @Test
+    public void missingConfigIsNotTreatedAsAFailure() throws Exception {
+        String base = read(BASE_CONFIG);
+        assertFalse("BaseConfig 不得再把'没配地址'当成 error(\"\")", base.contains("callback.error(\"\")"));
+        assertTrue("没有配置地址必须走 callback.noConfig()", base.contains("callback::noConfig"));
+        assertTrue("Callback 必须提供 noConfig 钩子", read(CALLBACK).contains("public void noConfig()"));
+
+        String event = read(EVENT);
+        assertTrue("StateEvent 必须有 NO_CONFIG 类型", event.contains("NO_CONFIG"));
+        assertTrue("必须提供 noConfig() 工厂", event.contains("public static void noConfig()"));
+
+        String home = read(HOME);
+        String noConfig = methodBody(home, "public void noConfig()");
+        assertTrue("Activity 收到 noConfig 必须广播 StateEvent.noConfig()", noConfig.contains("StateEvent.noConfig()"));
+
+        String fragment = read(FRAGMENT);
+        String handler = methodBody(fragment, "public void onStateEvent(StateEvent event)");
+        assertTrue("Fragment 必须处理 NO_CONFIG 分支", handler.contains("case NO_CONFIG:"));
+        // NO_CONFIG 是最后一个分支，取到方法体末尾即可（用固定结尾串切分会踩 CRLF 的坑）。
+        String noConfigCase = handler.substring(handler.indexOf("case NO_CONFIG:"));
+        assertTrue("NO_CONFIG 必须走 showNoConfig() 而不是显示错误态", noConfigCase.contains("showNoConfig()"));
+        assertFalse("NO_CONFIG 不得渲染错误态", noConfigCase.contains("showError("));
+
+        String showNoConfig = methodBody(fragment, "private void showNoConfig()");
+        // 未配置不再独占首页：收起状态浮层、回到原生内容态，底部导航（点播/设置）照常可用。
+        assertTrue("未配置必须收起状态浮层", showNoConfig.contains("hideState()"));
+        assertTrue("未配置必须回到原生内容态", showNoConfig.contains("showNativeContent()"));
+        assertFalse("未配置不得再用全屏空态", showNoConfig.contains("showEmpty()"));
+        assertFalse("未配置态的主动作不得是重试", showNoConfig.contains("retryConfig"));
+        // 导航栏只由既有项构成：未配置时不再额外插入任何入口。
+        assertFalse("未配置不得在导航栏里插入额外项",
+                home.contains("home_no_config_action") || home.contains("MENU_NO_CONFIG"));
+        assertFalse("未配置不再要求 Fragment 承载第二个配置入口",
+                fragment.contains("openVodConfig"));
+    }
+
+    /**
+     * 配置在**别的路径**上变得可用后，首页不能继续顶着状态卡。
+     *
+     * <p>用户反馈："卸载后重新安装再通过备份恢复也会出现类似情况，必现；杀进程后重进才行"。
+     * 恢复备份走的是 {@code RefreshEvent.home()} 而不是重新走首页启动（{@code showContent()}），
+     * 而状态浮层只被启动成功与点重试收掉——于是配置明明已经可用，首页仍停在状态卡上。
+     */
+    @Test
+    public void aConfiguredSourceDismissesAStaleStateOverlay() throws Exception {
+        String fragment = read(FRAGMENT);
+        String handler = methodBody(fragment, "public void onRefreshEvent(RefreshEvent event)");
+        assertTrue("HOME 刷新时必须检查并收起过期的状态卡", handler.contains("dismissStateIfConfigured()"));
+        String dismiss = methodBody(fragment, "private void dismissStateIfConfigured()");
+        assertTrue("只有配置真的可用（有站点）时才收起", dismiss.contains("getSites().isEmpty()"));
+        assertTrue("收起动作必须真的隐藏浮层", dismiss.contains("hideState()"));
+        // 只在浮层真的可见时动它：收起动作不得在正常内容态上乱改可见性。
+        assertTrue("必须先判浮层可见", dismiss.contains("getVisibility()"));
     }
 
     // ------------------------------------------------------------------ helpers
