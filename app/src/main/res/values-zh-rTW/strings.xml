@@ -13,6 +13,7 @@
     <string name="live_refresh">刷新</string>
     <string name="live_line">來源 <xliff:g name="name">%s</xliff:g></string>
     <string name="live_control_source">直播源</string>
+    <string name="live_control_source_named">直播源：<xliff:g name="name">%s</xliff:g></string>
 
     <!-- Detail -->
     <string name="detail_title"><xliff:g name="name">%s</xliff:g>：<xliff:g name="name">%s</xliff:g></string>
@@ -912,6 +913,7 @@
     <string name="theme_editor_slot_scrim_opacity">遮罩透明度</string>
     <string name="theme_editor_slot_dialog_opacity">對話框透明度</string>
     <string name="theme_editor_slot_overlay_opacity">浮層透明度（僅 Web 主題生效）</string>
+    <string name="theme_editor_slot_player_scrim_opacity">播放選單遮罩不透明度</string>
     <string name="theme_editor_import">匯入配色</string>
     <string name="theme_editor_palette_style">配色風格 · 保留手動修改</string>
     <string name="theme_editor_palette_tonal">柔和</string>
@@ -1014,6 +1016,7 @@
     <string name="cache_cleanup_failed">暫存清理失敗</string>
     <string name="cache_cleanup_cancelled">暫存清理已取消</string>
     <string name="cache_cleanup_full_started">正在清理全部暫存…</string>
+    <string name="cache_cleanup_busy">正在清理，請稍候</string>
     <string name="cache_module_exo">Exo 播放暫存</string>
     <string name="cache_module_mpv_hls">MPV HLS/ISO 分片</string>
     <string name="cache_module_mpv_demuxer">MPV demuxer 預載</string>
@@ -1451,6 +1454,7 @@
     <string name="player_auto_play">點播自動播放</string>
     <string name="player_live_source_fallback">直播源失效自動切換</string>
     <string name="player_auto_change">自動換源</string>
+    <string name="player_defer_flag_switch">切換線路不自動播放</string>
     <string name="player_remember_brightness">記住播放亮度</string>
     <string name="player_failure_fallback">播放失敗回退</string>
     <string name="player_speed">長按倍速</string>
@@ -1636,6 +1640,14 @@
     <string name="home_empty_description">內容源沒有回傳可顯示的內容。</string>
     <string name="home_empty_action">重新載入</string>
     <!--
+        「還沒設定接口」空態：重置應用、重新安裝或恢復出廠後首次啟動就是這個狀態。
+        它**不是失敗**（沒有網址可請求，也沒有失敗原因，重試永遠不會成功），所以標題不用
+        錯誤色、主動作也不是「重試」而是「新增接口」——直接把使用者帶到接口管理清單。
+    -->
+    <string name="home_no_config_title">還沒有設定接口</string>
+    <string name="home_no_config_description">新增一個點播接口後即可瀏覽內容。</string>
+    <string name="home_no_config_action">新增接口</string>
+    <!--
         本機檔案瀏覽器空態。主動作是**重新掃描目前目錄**，不是「返回上級」——因為：
         根目錄沒有上級（返回會離開頁面），而「重新掃描」在任何目錄都成立，
         且能反映外部變化（剛用其他應用放進來的檔案）。
@@ -1756,6 +1768,15 @@
     <string name="crash_details_title">錯誤訊息</string>
     <string name="crash_details_message">應用版本：%1$s\n\n%2$s</string>
     <string name="crash_details_close">關閉</string>
+    <string name="crash_log_title">日誌下載位址</string>
+    <string name="crash_log_hint">用同一區域網路內的手機或電腦瀏覽器開啟上面的位址，即可檢視並下載本次崩潰日誌。</string>
+    <string name="crash_log_preparing">正在準備日誌服務…</string>
+    <string name="crash_log_unavailable">日誌服務未啟動，可點按「錯誤訊息」查看堆疊。</string>
+    <string name="crash_log_no_lan">目前沒有區域網路位址（未連線網路？），只能在本機開啟：\n%1$s</string>
+    <string name="crash_log_service_failed">日誌服務未啟動</string>
+    <string name="crash_log_copy">複製位址</string>
+    <string name="crash_log_copied">位址已複製</string>
+    <string name="crash_log_open">在瀏覽器開啟</string>
 
     <!-- Hint -->
     <string name="copied">已複製</string>
@@ -1950,6 +1971,7 @@
         <item>@string/display_mini</item>
         <item>@string/display_title</item>
         <item>播放參數</item>
+        <item>@string/display_media_badges</item>
     </string-array>
 
     <string-array name="select_live_player_osd">
@@ -2131,6 +2153,14 @@
     <string name="display_progress">進度</string>
     <string name="display_mini">迷你</string>
     <string name="display_title">標題</string>
+    <string name="display_media_badges">媒體資訊</string>
+    <string name="osd_media_badge_position">媒體資訊位置</string>
+    <string-array name="select_media_badge_position">
+        <item>左上角</item>
+        <item>右上角</item>
+        <item>左下角</item>
+        <item>右下角</item>
+    </string-array>
     <string name="play_decode_idle">解碼</string>
     <string name="detail_close">關閉</string>
     <string name="detail_expand">展開</string>
@@ -2833,6 +2863,7 @@
     <string-array name="select_fullscreen_menu_key">
         <item>控制欄</item>
         <item>選集</item>
+        <item>下一集</item>
     </string-array>
     <string-array name="select_home_menu_key">
         <item>選項彈窗</item>
