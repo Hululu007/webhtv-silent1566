@@ -179,6 +179,7 @@ import com.fongmi.android.tv.ui.helper.EpisodeSeasonPolicy;
 import com.fongmi.android.tv.ui.helper.SourceEpisodeSeasonCache;
 import com.fongmi.android.tv.ui.helper.EpisodeRangePolicy;
 import com.fongmi.android.tv.ui.helper.PlayerControlFocusHelper;
+import com.fongmi.android.tv.ui.helper.TmdbMatchPolicy;
 import com.fongmi.android.tv.ui.helper.TmdbNavigation;
 import com.fongmi.android.tv.ui.helper.TmdbBundle;
 import com.fongmi.android.tv.ui.helper.TmdbSourceAdapter;
@@ -265,7 +266,7 @@ import java.util.concurrent.CancellationException;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-public class VideoActivity extends PlaybackActivity implements Clock.Callback, CustomKeyDown.Listener, TrackDialog.Listener, ControlDialog.Listener, DanmakuDialog.Host, FlagAdapter.OnClickListener, EpisodeAdapter.OnClickListener, EpisodeGroupAdapter.OnClickListener, QualityAdapter.OnClickListener, QuickAdapter.OnClickListener, ParseAdapter.OnClickListener, CastDialog.Listener, InfoDialog.Listener, SubtitlePlaybackSession.Host, com.fongmi.android.tv.ui.novel.NovelReaderHost {
+public class VideoActivity extends PlaybackActivity implements Clock.Callback, CustomKeyDown.Listener, TrackDialog.Listener, ControlDialog.Listener, DanmakuDialog.Host, FlagAdapter.OnClickListener, EpisodeAdapter.OnClickListener, EpisodeGroupAdapter.OnClickListener, QualityAdapter.OnClickListener, QuickAdapter.OnClickListener, ParseAdapter.OnClickListener, CastDialog.Listener, InfoDialog.Listener, SubtitlePlaybackSession.Host, com.fongmi.android.tv.ui.novel.NovelReaderHost, com.fongmi.android.tv.plugin.PluginSurface.ImmersiveAware {
     /**
      * 用户拖拽 seek 时加载圈的最小可见时长。
      *
@@ -457,6 +458,18 @@ private int mAudioBackgroundRandomNonce;
     private List<String> mBroken;
     private History mHistory;
     private boolean fullscreen;
+    /**
+     * 本页当前的画中画状态。
+     *
+     * <p>两个写点，各有分工：{@code onPictureInPictureModeChanged} 用形参写（回调是唯一能保证
+     * 事件顺序的地方），{@code initView} 用 {@code isInPictureInPictureMode()} 写初值——进程在
+     * 画中画中被回收后恢复不会再走一次回调，字段停在 {@code false} 会把恢复中的小窗当全屏。
+     *
+     * <p><b>为什么消费侧读字段而不是现场问平台。</b>不是为了绕开回调时序（平台在派发前已写好
+     * 该状态，回调里问也是新值），而是为了让"这一次形态变更"只有一个快照：判据在重算入口与
+     * 发事件之间必须看到同一个值，现场再问一次就可能取到别的时点。
+     */
+    private boolean inPip;
     private boolean initAuto;
     private boolean autoMode;
     private boolean revealManualSearch;
@@ -915,8 +928,7 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
     public static void startDirectTmdb(Activity activity, String key, String id, String name, String pic, String mark, ArrayList<String> episodeTitles, TmdbItem item, Vod tmdbVod, Vod detailVod, String tmdbDetailCacheKey, String playFlag, String playEpisodeName, String playEpisodeUrl, int playSeasonNumber, int playEpisodeNumber, History resumeHistory) {
         startDirectTmdb(activity, key, id, name, pic, mark, episodeTitles, item, tmdbVod, detailVod,
                 tmdbDetailCacheKey, playFlag,
-                resumeHistory == null ? "" : resumeHistory.getSourceBindingKey(),
-                playEpisodeName, playEpisodeUrl, playSeasonNumber, playEpisodeNumber, resumeHistory);
+                "", playEpisodeName, playEpisodeUrl, playSeasonNumber, playEpisodeNumber, resumeHistory);
     }
 
     public static void startDirectTmdb(Activity activity, String key, String id, String name, String pic, String mark, ArrayList<String> episodeTitles, TmdbItem item, Vod tmdbVod, Vod detailVod, String tmdbDetailCacheKey, String playFlag, String playFlagKey, String playEpisodeName, String playEpisodeUrl, int playSeasonNumber, int playEpisodeNumber, History resumeHistory) {
@@ -1504,6 +1516,11 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
     }
 
     @Override
+    protected long getDurationFallbackMs() {
+        return mHistory == null ? C.TIME_UNSET : mHistory.getDuration();
+    }
+
+    @Override
     protected void onServiceConnected() {
         player().setDanmakuController(mBinding.exo.getDanmakuController());
         applyPendingPlayerKernel();
@@ -1593,6 +1610,9 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
         initializeRuntimeDetailMode();
         mTmdbDetailTimeout = this::showTmdbDetailFallback;
         super.initView(savedInstanceState);
+        // 初始值必须来自平台真实状态：进程在画中画里被回收后重建时不会再走一次回调，
+        // 字段留在默认 false 就会把恢复中的 PiP 短暂当成全屏。
+        inPip = isInPictureInPictureMode();
         applyPlaybackOverlay();
         mRestoringConfigurationPlayback = savedInstanceState != null;
         ViewCompat.setOnApplyWindowInsetsListener(mBinding.getRoot(), (v, insets) -> setStatusBar(insets));
@@ -2819,6 +2839,7 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
     }
 
     private void getPlayer(Flag flag, Episode episode) {
+        publishPluginEpisodeContext(episode);
         mBinding.control.title.setText(getPlaybackControlTitle(episode));
         playerStartTime = System.currentTimeMillis();
         beginPlayHealth();
@@ -2838,6 +2859,49 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
         mBinding.control.title.setSelected(true);
         updateHistory(episode);
         showProgress();
+    }
+
+    /**
+     * 把当前集的剧集身份交给插件通道。
+     *
+     * <p>挂在起播的唯一收口而不是各个点击处：初次进入、点集、自动连播、切线路与阅读器
+     * 换章最后都汇到这一个方法，只有在这里注入才不会有某条路径漏发。上下文是可选增强，
+     * 任何异常都不许影响播放，所以整段吞掉。
+     */
+    private void publishPluginEpisodeContext(Episode episode) {
+        try {
+            com.fongmi.android.tv.bean.TmdbItem item = mTmdbUIAdapter == null ? null : mTmdbUIAdapter.getTmdbItem();
+            if (item == null) item = getTmdbItem();
+            com.google.gson.JsonObject context = com.fongmi.android.tv.plugin.PluginEpisodePayload.of(item, mVod, episode);
+            com.fongmi.android.tv.plugin.PluginEpisodeContext.publish(getClass().getSimpleName(), context);
+            // episode.changed 与上下文槽共用同一个 of() 结果：插件若从事件读到 A、点击时从槽里读到 B，
+            // 表现就是"评论串台"，而这类错在日志里没有任何痕迹。这里传的是 JsonObject，
+            // 序列化发生在 helper 内部的 hasSubscribers 短路之后，因此无订阅者时这一行确实零行为。
+            com.fongmi.android.tv.plugin.PluginHostEvents.episodeChanged(this, context);
+        } catch (Throwable ignored) {
+            // 插件上下文是可选增强：拿不到就当没有，绝不影响播放。
+        }
+    }
+
+    /**
+     * 回到本页时重新认领剧集上下文。
+     *
+     * <p>{@code PluginEpisodeContext} 是全局单槽：播放页发布后本页的快照就被覆盖了，而
+     * 返回本页不会触发任何起播路径。不在这里补发，用户走过一次「本页 → 别的页 → 返回」
+     * 之后，插件 chip 读到的永远是 {@code null}（名字不匹配即 null）——这是永久缺口，
+     * 不是一次竞态。
+     *
+     * <p>拿不到当前集时直接返回，不发布：{@code publish(name, null)} 的语义是「清除」，
+     * 一次没有数据的回归发布会把原本正确的快照擦掉，比不发布更糟。
+     */
+    private void republishPluginEpisodeContext() {
+        try {
+            Episode episode = getEpisode();
+            if (episode == null) return;
+            publishPluginEpisodeContext(episode);
+        } catch (Throwable ignored) {
+            // 插件上下文是可选增强：任何异常都不许影响播放页回归。
+        }
     }
 
     private void beginPlayerContentRequest(String key, String flag, String episode) {
@@ -3606,6 +3670,19 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
 
     private int getSelectedEpisodePosition(List<Episode> items) {
         for (int i = 0; i < items.size(); i++) if (items.get(i).isSelected()) return i;
+        if (mHistory == null) return 0;
+        Episode historyEpisode = mHistory.getEpisode();
+        // 与 leanback 对齐：历史集 URL 能定位到当前列表条目时先按 URL 锁定版本（同集多版本并存），
+        // 换线路/换源/源站刷新后 URL 必然失配，交回下面的集号容错。
+        for (int i = 0; i < items.size(); i++) {
+            if (TextUtils.isEmpty(historyEpisode.getUrl())) break;
+            if (!TextUtils.equals(historyEpisode.getUrl(), items.get(i).getUrl())) continue;
+            if (items.get(i).getTmdbEpisode() != null && items.get(i).getTmdbEpisode().getNumber() > 0
+                    && historyEpisode.getTmdbEpisode() != null && historyEpisode.getTmdbEpisode().getNumber() > 0
+                    && !items.get(i).matchesNumber(historyEpisode)) continue;
+            return i;
+        }
+        for (int i = 0; i < items.size(); i++) if (items.get(i).matchesPlayback(historyEpisode)) return i;
         return 0;
     }
 
@@ -3620,11 +3697,20 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
     }
 
     private boolean seamless(Flag flag) {
-        Episode episode = getMark().isEmpty() ? flag.find(mHistory.getEpisode(), true) : flag.find(mHistory.getVodRemarks(), false);
+        // 与 leanback 对齐：先按历史集身份定位（URL 优先、集号容错），刮削标题只作兜底。
+        Episode episode = mHistory == null ? null : flag.find(mHistory.getEpisode(), true);
+        if (episode == null && !getMark().isEmpty()) episode = flag.find(getMark(), false);
         setQualityVisible(episode != null && episode.isSelected() && mQualityAdapter.getItemCount() > 1);
         if (episode == null || (isPlaybackFlag(flag) && episode.isSelected())) return false;
-        mHistory.setVodRemarks(getHistoryEpisodeName(episode));
-        mHistory.setEpisodeUrl(episode.getUrl());
+        // 防御性守卫：mHistory 在历史创建/恢复之后恒非空（:1379 定位结果、:6010 resumeHistory、:6013 createHistory 兜底），
+        // 此处仅防止早期回调路径在历史尚未建立时解引用；返回 false 表示未处理。
+        if (mHistory == null) return false;
+        // 只有定位到的集与历史身份一致（或历史尚无 URL）时才回写，避免把错版本固化成下次续播目标。
+        boolean sameHistoryIdentity = TextUtils.isEmpty(mHistory.getEpisodeUrl()) || episode.matchesPlayback(mHistory.getEpisode(), flag.containsEpisodeUrl(mHistory.getEpisode()));
+        // 集名与 URL 同为身份键（Flag.find 按 remarks 打分、History.matchesEpisode 严格比对），必须同进同退，
+        // 否则会落库 (remarks=兜底集标题, url=旧URL) 的矛盾身份。
+        if (sameHistoryIdentity) mHistory.setVodRemarks(getHistoryEpisodeName(episode));
+        if (sameHistoryIdentity) mHistory.setEpisodeUrl(episode.getUrl());
         onItemClick(episode);
         return true;
     }
@@ -5999,7 +6085,7 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
         // 如果历史记录中已有有效倍速，使用历史倍速；否则使用默认播放倍速
         float speed = getPlaybackSpeed();
         mBinding.control.action.speed.setText(player().setSpeed(speed));
-        mHistory.setVodName(item.getName());
+        mHistory.setVodName(historyVodName(item));
         mHistory.setVodPic(getInitialArtwork(item));
         enrichHistoryMeta(item);
         PlaybackEventCollector.get().updateHistory(mHistory);
@@ -6116,11 +6202,23 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
         else if (!getWallPic().isEmpty()) setContextWall(getWallPic());
     }
 
+    /**
+     * 推送片名：真实片名在 Intent 里，源站 Vod 常常只有裸地址，直接用它弹幕必然搜不到。
+     */
+    private String historyVodName(Vod item) {
+        String name = item == null ? "" : item.getName();
+        if (!SiteApi.PUSH.equals(getKey())) return name;
+        PushParser.Parsed push = PushParser.fromId(getId());
+        if (push.hasExplicitTitle()) return push.getTitle();
+        String intentName = getName();
+        return TmdbMatchPolicy.shouldAutoMatchPushTitle(intentName) ? intentName : name;
+    }
+
     private History createHistory(Vod item) {
         History history = new History();
         history.setKey(getHistoryKey());
         history.setCid(VodConfig.getCid());
-        history.setVodName(item.getName());
+        history.setVodName(historyVodName(item));
         history.setVodPic(getInitialArtwork(item));
         history.setWallPic(getWallPic());
         history.findEpisode(item.getFlags());
@@ -6399,7 +6497,7 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
             }
         }
         boolean historyReloaded = reloadHistoryAfterTmdbMatch();
-        if (name) mHistory.setVodName(item.getName());
+        if (name) mHistory.setVodName(historyVodName(item));
         if (name) mBinding.name.setText(item.getName());
         // 原生增强：TMDB 富集完成后回写题材/地区/演员/主创到 History（enrichVod 已填充 item，仅补空字段）
         if (mHistory != null) {
@@ -8183,6 +8281,7 @@ private final Task.Scope mPersonalRecommendationTasks = new Task.Scope(Task.reco
         if (isRedirect() || !event.isVod()) return;
         if (mTmdbUIAdapter != null) mTmdbUIAdapter.invalidateSubscription();
         if (mParseAdapter != null) mParseAdapter.reload();
+        if (player() != null) player().dropStaleBundleDanmaku();
     }
 
     /**
@@ -8485,6 +8584,40 @@ private void checkOrientation() {
     private void setFullscreen(boolean fullscreen) {
         Util.toggleFullscreen(this, this.fullscreen = fullscreen);
         updateFusionThemeButtonVisibility();
+        notifyPluginFullscreen();
+    }
+
+    /**
+     * 页面自报沉浸态：本页是否处于全屏播放。
+     *
+     * <p>画中画不算：PiP 下用户仍在与本页交互，入口该留着。判断读 {@link #inPip} 这个快照，
+     * 让"重算入口"与"广播事件"看到同一份形态，而不是各自去问一次平台。
+     */
+    @Override
+    public boolean isImmersive() {
+        return fullscreen && !inPip;
+    }
+
+    /**
+     * 全屏形态变化后通知插件层：先重算入口可见性，再把新形态广播给订阅者。
+     *
+     * <p>挂在这里而不是 {@code enterFullscreen} / {@code exitFullscreen} 上：那两条只是入口，
+     * 短剧、旋转、PiP 恢复各自还有自己的路径，只有 {@code setFullscreen} 与 PiP 回调是所有变化的收口。
+     *
+     * <p>广播值取 {@link #isImmersive()} 而不是裸 {@code fullscreen}：入口的隐藏判据就是它。
+     * 两处取不同值会让画中画期间事件报「全屏」而入口仍然可见，声明与行为脱钩。
+     */
+    private void notifyPluginFullscreen() {
+        try {
+            com.fongmi.android.tv.plugin.PluginController.get().refreshRender(this);
+        } catch (Throwable ignored) {
+            // 插件入口是可选增强：重算失败不该影响播放页。
+        }
+        try {
+            com.fongmi.android.tv.plugin.PluginHostEvents.playbackFullscreen(this, isImmersive());
+        } catch (Throwable ignored) {
+            // 事件是可选增强：广播失败同样不该影响播放页。
+        }
     }
 
     private boolean isShortDramaSource() {
@@ -9892,6 +10025,9 @@ private void checkOrientation() {
     @Override
     public void onPictureInPictureModeChanged(boolean isInPictureInPictureMode, @NonNull Configuration newConfig) {
         super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig);
+        inPip = isInPictureInPictureMode;
+        // 判据已随形参翻转：本页只依赖 fullscreen 与 inPip，这里一次重算就够。
+        notifyPluginFullscreen();
         updateFusionThemeButtonVisibility();
         if (!isFullscreen()) setVideoView(isInPictureInPictureMode);
         if (isInPictureInPictureMode) {
@@ -9909,6 +10045,7 @@ private void checkOrientation() {
     @Override
     protected void onResume() {
         super.onResume();
+        republishPluginEpisodeContext();
         restoreContextWall();
         if (mAudioStageVisible) restorePlaybackArtwork();
         if (mAudioStageVisible) applyAudioBackground();

@@ -235,6 +235,9 @@ import com.fongmi.android.tv.utils.Clock;
 import com.fongmi.android.tv.utils.FileChooser;
 import com.fongmi.android.tv.player.lut.LutPreset;
 import com.fongmi.android.tv.player.lut.LutStore;
+import com.fongmi.android.tv.plugin.PluginController;
+import com.fongmi.android.tv.plugin.PluginHostEvents;
+import com.fongmi.android.tv.plugin.PluginSurface;
 import com.fongmi.android.tv.web.WebHomeInlineVodStore;
 import com.google.android.flexbox.FlexboxLayout;
 import com.google.android.material.button.MaterialButton;
@@ -281,11 +284,24 @@ import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-public class TmdbDetailActivity extends PlaybackActivity implements TrackDialog.Listener, Clock.Callback, PlayerGesture.Listener, SubtitlePlaybackSession.Host, TmdbDetailHost {
+public class TmdbDetailActivity extends PlaybackActivity implements TrackDialog.Listener, Clock.Callback, PlayerGesture.Listener, SubtitlePlaybackSession.Host, TmdbDetailHost, PluginSurface.ImmersiveAware {
 
     private static final DateTimeFormatter TIME_FORMAT = DateTimeFormatter.ofPattern("HH:mm:ss", Locale.getDefault());
     private static final int CHIP_STROKE_DP = 1;
     private static final int CHIP_MAX_WIDTH_DP = 240;
+    /**
+     * 芯片内边距，必须按 dp 换算后写入。
+     *
+     * 这里曾经直接写 {@code setPadding(24, 12, 24, 12)}——那是像素而不是 dp，于是同一份
+     * 代码在不同密度上得到不同内边距：320dpi（2x）上 24px=12dp 正常，280dpi（1.75x）上
+     * 24px≈13.7dp 偏大，480dpi（3x）上 24px 只有 8dp，文字就贴到描边上——这正是用户反馈的
+     * 「按钮边框包不住文本」，且只在部分密度设备上复现。
+     * 取值与同类芯片（{@code shape_video_item} 为画面按钮声明的 12dp/8dp 内边距）一致，
+     * 各密度下表现相同。本芯片背景来自 materialButtonOutlinedStyle 的 MaterialShapeDrawable，
+     * 与 {@code selector_video_item} 无关，12dp/8dp 只是取值对齐。
+     */
+    private static final int CHIP_PADDING_H_DP = 12;
+    private static final int CHIP_PADDING_V_DP = 8;
     private static final int PHOTO_PRELOAD_RADIUS = 2;
     /** 自动匹配消歧时同时最多在途的候选详情请求数。 */
     private static final int DISAMBIGUATION_CONCURRENCY = 3;
@@ -418,7 +434,26 @@ public class TmdbDetailActivity extends PlaybackActivity implements TrackDialog.
     private boolean autoPlayed;
     private boolean defaultPlaybackLaunchPending;
     private boolean inlineFullscreen;
+    /**
+     * 本页当前的画中画状态。
+     *
+     * <p>两个写点，各有分工：{@code onPictureInPictureModeChanged} 用形参写（回调是唯一能保证
+     * 事件顺序的地方），{@code initView} 用 {@code isInPictureInPictureMode()} 写初值——进程在
+     * 画中画中被回收后恢复不会再走一次回调，字段停在 {@code false} 会把恢复中的小窗当全屏。
+     *
+     * <p><b>为什么消费侧读字段而不是现场问平台。</b>不是为了绕开回调时序（平台在派发前已写好
+     * 该状态，回调里问也是新值），而是为了让"这一次形态变更"只有一个快照：本页 PiP 回调里
+     * 还要先翻转内嵌布局再重算入口，中途现场再问一次就会与已算过的值分叉。
+     */
+    private boolean inPip;
     private boolean inlineShortDramaMode;
+    /**
+     * 用户在内嵌全屏里显式选过的方向（旋转按钮）。非 {@code UNSPECIFIED} 表示用户已表态：
+     * 视频形态变化触发的自动方向重设不得再覆盖它，否则一次点击会被紧随其后的
+     * VideoSize/STATE_READY 回调改回原方向，表现成「按两次才生效」。
+     * 与 {@code VideoActivity.manualRotate} 同一语义。进/出内嵌全屏时清空，重建自动基线。
+     */
+    private int inlineManualOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED;
     private boolean inlinePauseInfo;
     private boolean inlinePlaybackReconnectPending;
     private boolean savingTmdbPhoto;
@@ -508,6 +543,10 @@ public class TmdbDetailActivity extends PlaybackActivity implements TrackDialog.
     private int renderedEpisodeRangeIndex = -1;
     private int pendingEpisodeRangeFocus = -1;
     private int lastDetailEpisodeFocusRowStart = RecyclerView.NO_POSITION;
+    // 长按连续选集：最近一次请求的目标卡片。焦点落地前按住方向的重复按键以它为基准继续推进，
+    // 同时充当待定对焦回调的失效令牌（换目标即作废旧回调）。
+    private int pendingDetailEpisodeTarget = RecyclerView.NO_POSITION;
+    private static final int DETAIL_EPISODE_FOCUS_MAX_ATTEMPTS = 6;
     private boolean tmdbMediaLoading;
     private boolean lightTheme;
     private boolean backdropSlideLoading;
@@ -735,6 +774,9 @@ public class TmdbDetailActivity extends PlaybackActivity implements TrackDialog.
         inflateMobileInlineControl();
         initModeController();
         super.initView(savedInstanceState);
+        // 初始值必须来自平台真实状态：进程在画中画里被回收后重建时不会再走一次回调，
+        // 字段留在默认 false 就会把恢复中的 PiP 短暂当成全屏。
+        inPip = isInPictureInPictureMode();
         tmdbConfig = TmdbConfig.effectiveCurrent();
         tmdbCredentialScope = SubscriptionTmdbCredentialStore.currentScope();
         initialTmdbItem = getIntentTmdbItem();
@@ -766,6 +808,11 @@ public class TmdbDetailActivity extends PlaybackActivity implements TrackDialog.
         vod = null;
         matchedTmdbItem = null;
         matchedTmdbDetail = null;
+        // 换源/换片会在同一个 Activity 里清空身份：不跟着撤回，插件在这段空窗里点开会读到上一部剧。
+        try {
+            com.fongmi.android.tv.plugin.PluginEpisodeContext.clear(getClass().getSimpleName());
+        } catch (Throwable ignored) {
+        }
         cachedEpisodeInfo = null;
         cachedEpisodeInfoItem = null;
         cachedEpisodeInfoDetail = null;
@@ -3315,6 +3362,42 @@ public class TmdbDetailActivity extends PlaybackActivity implements TrackDialog.
         clearSeasonResolutionCache();
         if (selectedFlag != null) loadTmdbSeasonBinding();
         updateTmdbSeasonActionVisibility();
+        publishPluginEpisodeContext();
+    }
+
+    /**
+     * 把当前详情页的剧集身份交给插件通道。
+     *
+     * <p>详情页没有"当前集"概念，{@code episode} 恒为 {@code null}；{@code bundle} 为空时
+     * 载荷随之清空——插件读不到数据，好过让它读到上一部剧的数据。
+     */
+    private void publishPluginEpisodeContext() {
+        try {
+            com.fongmi.android.tv.plugin.PluginEpisodeContext.publish(
+                    getClass().getSimpleName(),
+                    com.fongmi.android.tv.plugin.PluginEpisodePayload.of(matchedTmdbItem, vod, null));
+        } catch (Throwable ignored) {
+            // 插件上下文是可选增强：任何异常都不许影响详情页。
+        }
+    }
+
+    /**
+     * 回到本页时重新认领剧集上下文。
+     *
+     * <p>{@code PluginEpisodeContext} 是全局单槽：播放页发布后本页的快照就被覆盖了，而
+     * 返回本页不会触发任何重新装载。不在这里补发，用户走过一次「详情页 → 播放页 → 返回」
+     * 之后，本页的插件 chip 读到的永远是 {@code null}（名字不匹配即 null）。
+     *
+     * <p>身份已被 {@code resetDetailState()} 清空时直接返回，不发布：{@code publish(name, null)}
+     * 的语义是「清除」，一次没有数据的回归发布会把原本正确的快照擦掉，比不发布更糟。
+     */
+    private void republishPluginEpisodeContext() {
+        try {
+            if (matchedTmdbItem == null && vod == null) return;
+            publishPluginEpisodeContext();
+        } catch (Throwable ignored) {
+            // 插件上下文是可选增强：任何异常都不许影响详情页回归。
+        }
     }
 
     private void showTmdbMatchDialog(List<TmdbItem> items) {
@@ -5040,19 +5123,16 @@ public class TmdbDetailActivity extends PlaybackActivity implements TrackDialog.
             String remarks = history != null ? history.getVodRemarks() : "";
             if (selectedEpisode == null) selectedEpisode = findEpisodeByUrl(history == null ? "" : history.getEpisodeUrl(), selectedFlag.getEpisodes());
             if (selectedEpisode == null) selectedEpisode = selectedFlag.find(remarks, getMarkText().isEmpty());
+            // 三条身份通道（intent URL / 历史 URL / 历史备注）全失败时才退到第一集，这是最后兜底。
             if (selectedEpisode == null) selectedEpisode = episodes.get(0);
         }
         List<Integer> availableSeasons = availableSeasonNumbers(episodes);
-        if (availableSeasons.isEmpty()) {
-            selectedSeasonNumber = -1;
-        } else if (selectedSeasonNumber < 0 || !availableSeasons.contains(selectedSeasonNumber)) {
-            selectedSeasonNumber = seasonForEpisode(selectedEpisode, episodes);
-        }
+        // seasonForEpisode 在可选季非空时必返回其中之一（其唯一返回 -1 的路径是可选季为空），
+        // 因此这里不需要再判断季号是否落在可选季内，也不存在"选不到集"的分支：
+        // selectedEpisode 已由上一段四通道兜到首集，恒非空。
+        selectedSeasonNumber = availableSeasons.isEmpty() ? -1 : seasonForEpisode(selectedEpisode, episodes);
         refreshSeasonContext();
         List<Episode> visibleEpisodes = visibleEpisodes(episodes);
-        if (!visibleEpisodes.isEmpty() && !visibleEpisodes.contains(selectedEpisode)) {
-            selectedEpisode = visibleEpisodes.get(0);
-        }
         renderSeasonSelection();
         bindSeasonEpisodes(episodes);
         refreshCurrentHistoryEpisodeTitle();
@@ -5426,6 +5506,9 @@ public class TmdbDetailActivity extends PlaybackActivity implements TrackDialog.
         boolean down = KeyUtil.isDownKey(event);
         int target = TmdbEpisodeGridPolicy.verticalFocusTarget(position, span, episodeAdapter.getItemCount(), down);
         if (target == TmdbEpisodeGridPolicy.NO_FOCUS_TARGET) {
+            // 长按撞到首行/末行时停在原地。把焦点甩出网格会让"按住方向浏览选集"在边界处
+            // 突然跳到 TMDB 行并继续横向跑；松手后再按一次才按原规则离开网格。
+            if (event.getRepeatCount() > 0) return true;
             if (!down) {
                 if (focusDetailEpisodeRangeButton()) return true;
                 if (focusDetailEpisodeToolButton(View.FOCUS_UP)) return true;
@@ -5433,6 +5516,9 @@ public class TmdbDetailActivity extends PlaybackActivity implements TrackDialog.
             }
             return focusFirstVisibleTmdbRow();
         }
+        // 首次按键继续交给 RecyclerView 原生焦点搜索；只有长按重复事件才显式接管，
+        // 因为此时焦点尚未落到新卡片，FocusFinder 会按旧焦点再算一次，表现为按住上下只走一格。
+        if (event.getRepeatCount() > 0) return focusDetailEpisode(target);
         return false;
     }
 
@@ -5842,29 +5928,38 @@ public class TmdbDetailActivity extends PlaybackActivity implements TrackDialog.
     }
 
     private boolean focusDetailEpisode(int position) {
+        return focusDetailEpisode(position, 0);
+    }
+
+    /**
+     * 把焦点送到选集网格的某一集，直到真正落地为止。
+     *
+     * <p>原来未命中可见卡片时排一次 {@code post} + {@code postDelayed(80ms)}：按住方向键时每个重复
+     * 事件都会再排一条，焦点还没落到上一集就又被下一个 80ms 回调按过期坐标 {@code scrollToPosition}
+     * 拽回去，表现为长按只走一格、松手后选集列表闪回原处（用户报告）。
+     * 这里改成「按帧重试 + 目标即令牌」：目标换了作废旧回调，成功落地即停。
+     */
+    private boolean focusDetailEpisode(int position, int attempt) {
         if (binding == null || episodeAdapter == null || episodeAdapter.getItemCount() == 0) return false;
         int target = Math.max(0, Math.min(position, episodeAdapter.getItemCount() - 1));
         int span = detailEpisodeSpanCount();
         int rowStart = Math.max(0, target - target % span);
+        pendingDetailEpisodeTarget = target;
         RecyclerView.ViewHolder visibleHolder = binding.episodeContainer.findViewHolderForAdapterPosition(target);
         if (visibleHolder != null) {
             binding.episodeContainer.stopScroll();
-            visibleHolder.itemView.requestFocus();
-            if (episodeGridMode) alignDetailEpisodeFocusedRow(visibleHolder.itemView, target);
-            return true;
-        }
-        binding.episodeContainer.post(() -> {
+            if (visibleHolder.itemView.requestFocus()) {
+                if (episodeGridMode) alignDetailEpisodeFocusedRow(visibleHolder.itemView, target);
+                return true;
+            }
+        } else if (attempt == 0) {
             binding.episodeContainer.stopScroll();
             scrollEpisodeToPosition(rowStart, ResUtil.dp2px(8));
-            binding.episodeContainer.postDelayed(() -> {
-                RecyclerView.ViewHolder holder = binding.episodeContainer.findViewHolderForAdapterPosition(target);
-                if (holder == null) {
-                    binding.episodeContainer.requestFocus();
-                    return;
-                }
-                holder.itemView.requestFocus();
-                if (episodeGridMode) alignDetailEpisodeFocusedRow(holder.itemView, target);
-            }, 80);
+        }
+        if (attempt >= DETAIL_EPISODE_FOCUS_MAX_ATTEMPTS) return true;
+        binding.episodeContainer.postOnAnimation(() -> {
+            if (binding == null || pendingDetailEpisodeTarget != target) return;
+            focusDetailEpisode(target, attempt + 1);
         });
         return true;
     }
@@ -6752,6 +6847,7 @@ public class TmdbDetailActivity extends PlaybackActivity implements TrackDialog.
         selectedSeasonNumber = getIntentPlaybackSeasonNumber();
         resetEpisodeRange();
         renderFlagSelection();
+        renderEpisodes();
     }
 
     private float getInlinePlaybackSpeed() {
@@ -6785,15 +6881,26 @@ public class TmdbDetailActivity extends PlaybackActivity implements TrackDialog.
             long start = System.currentTimeMillis();
             logTmdbMatch("原生增强播放标题：raw=%s，缓存标题=%s，详情标题=%s，播放标题=%s", getTmdbRawTitle(), matchedTmdbItem == null ? "" : matchedTmdbItem.getTitle(), tmdbDetailTitle(matchedTmdbItem, matchedTmdbDetail), playbackHistoryName());
             TmdbItem item = playbackTmdbItem();
-            EpisodePosition position = historyEpisodePosition(selectedEpisode);
+            EpisodePosition position = historyEpisodePosition(playbackEpisode());
             String tmdbDetailCacheKey = TmdbDetailCache.put(item, matchedTmdbDetail, detailCastItems, TmdbLanguagePolicy.requestLanguage(tmdbConfig, Setting.getLanguage()), tmdbSeasonEpisodes);
             SpiderDebug.log("tmdb-tv", "play launch prep cost=%dms title=%s", System.currentTimeMillis() - start, playbackHistoryName());
             VideoActivity.startDirectTmdb(this, getKeyText(), getIdText(), playbackHistoryName(), playbackHistoryPic(), playbackMark(), fastPlaybackEpisodeTitles(), item, playbackTmdbVod(), vod, tmdbDetailCacheKey, playbackFlag(), selectedSeasonFlagKey(), playbackEpisodeName(), playbackEpisodeUrl(), position.season(), position.number(), isResumeFromHistory() ? getIntentResumeHistory() : null);
         });
     }
 
+    private Episode playbackEpisode() {
+        if (selectedEpisode != null) return selectedEpisode;
+        List<Episode> episodes = selectedFlag == null ? null : selectedFlag.getEpisodes();
+        Episode requested = findEpisodeByUrl(getIntentPlaybackEpisodeUrl(), episodes);
+        if (requested != null) return requested;
+        Episode saved = history == null ? null : history.getEpisode();
+        if (saved == null || episodes == null || episodes.isEmpty()) return null;
+        return selectedFlag.find(saved, true);
+    }
+
     private String playbackMark() {
-        if (selectedEpisode != null && !TextUtils.isEmpty(selectedEpisode.getName())) return selectedEpisode.getName();
+        Episode episode = playbackEpisode();
+        if (episode != null && !TextUtils.isEmpty(episode.getName())) return episode.getName();
         return getMarkText();
     }
 
@@ -6802,17 +6909,20 @@ public class TmdbDetailActivity extends PlaybackActivity implements TrackDialog.
     }
 
     private String playbackEpisodeName() {
-        return selectedEpisode == null ? playbackMark() : selectedEpisode.getName();
+        Episode episode = playbackEpisode();
+        return episode == null ? "" : Objects.toString(episode.getName(), "");
     }
 
     private String playbackEpisodeUrl() {
-        return selectedEpisode == null ? "" : selectedEpisode.getUrl();
+        Episode episode = playbackEpisode();
+        return episode == null ? "" : Objects.toString(episode.getUrl(), "");
     }
 
     private ArrayList<String> fastPlaybackEpisodeTitles() {
         ArrayList<String> result = new ArrayList<>(1);
-        if (selectedEpisode == null) return result;
-        int number = episodeNumberForHistory(selectedEpisode);
+        Episode episode = playbackEpisode();
+        if (episode == null) return result;
+        int number = episodeNumberForHistory(episode);
         String title = tmdbEpisodeTitle(number);
         if (number > 0 && !TextUtils.isEmpty(title)) result.add(number + "\t" + title);
         return result;
@@ -7904,6 +8014,11 @@ public class TmdbDetailActivity extends PlaybackActivity implements TrackDialog.
         inlineStartPosition = resumePosition == C.TIME_UNSET ? getInlineResumePosition() : Math.max(0, resumePosition);
         inlineStartPositionApplied = false;
         player().preparePlayer(inlineHistoryPlayerKernel());
+        // 内核不一致时 preparePlayer() 会在 PlaySpec 建立之前就重建引擎，那一刻 getKey() 还是
+        // null、归属判定必为假，PlaybackActivity.onPlayerRebuild() 会整段跳过——其中就包含
+        // setProgressPlayer()。进度视图于是继续读已被 release 的旧引擎，读到时长 0、位置 0，
+        // 进度条恒为 00:00。这里在重建刚发生后显式跟上新引擎，对齐 leanback VideoActivity 的同一处理。
+        getSeekView().setProgressPlayer(player().getPlayer());
         setInlineSpeed(getInlinePlaybackSpeed());
         updateInlineButtons(false);
         Site site = getCurrentSite();
@@ -10272,6 +10387,9 @@ public class TmdbDetailActivity extends PlaybackActivity implements TrackDialog.
         if (isLock()) {
             setRequestedOrientation(PlaybackOrientation.getScreenOrientation(this));
             hideInlineGestureOverlays();
+        } else if (inlineManualOrientation != ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED) {
+            // 解锁后回到用户选过的方向，而不是按视频形态重算，否则旋转按钮的效果会被解锁动作抹掉。
+            setRequestedOrientation(inlineManualOrientation);
         } else {
             setInlineFullscreenOrientation();
         }
@@ -10281,15 +10399,63 @@ public class TmdbDetailActivity extends PlaybackActivity implements TrackDialog.
     private void rotateInlineFullscreen() {
         if (!Util.isMobile() || !inlineFullscreen || isLock()) return;
         touchInlineControls();
-        setRequestedOrientation(ResUtil.isLand(this) ? ActivityInfo.SCREEN_ORIENTATION_USER_PORTRAIT : ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
+        // 方向由用户这次点击决定：先记下期望方向，再请求。随后到来的 VideoSize/STATE_READY
+        // 会走 applyInlineShortDramaMode 按视频形态重算方向，没有这个标记就会把刚转过去的方向
+        // 改回原方向，用户看到的就是「第一次点击完全没反应，第二次才转」。
+        inlineManualOrientation = ResUtil.isLand(this) ? ActivityInfo.SCREEN_ORIENTATION_USER_PORTRAIT : ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE;
+        setRequestedOrientation(inlineManualOrientation);
         scheduleMobileInlineSideControlMarginUpdate();
+    }
+
+    /**
+     * 页面自报沉浸态：本页是否处于全屏播放。
+     *
+     * <p>只认本页自己的 {@code inlineFullscreen} 字段——{@code Util.isFullscreen} 在电视端
+     * 恒为 true，拿它当判据会让 TV 上的插件入口永久消失。
+     *
+     * <p><b>电视端一律不算沉浸。</b>本页手机与电视共用，而电视上"播放页"本身就是全屏常态，
+     * 把内嵌播放器算成沉浸态会让插件入口在电视上永远不可用——那是把功能拿掉，不是沉浸。
+     * 手机才有"内嵌小窗 ⇄ 全屏"这个切换，隐藏的逻辑只对它成立。
+     *
+     * <p>画中画不算沉浸：{@code inlinePiPLayout} 与系统 PiP 下本页仍在内嵌形态与用户
+     * 交互，入口该留着。PiP 判断读 {@link #inPip} 这个快照——本页 PiP 回调要先把内嵌布局
+     * 翻转再重算入口，判据若现场问平台，两次取值可能落在翻转前后不同的时点。
+     */
+    @Override
+    public boolean isImmersive() {
+        if (Util.isLeanback()) return false;
+        return inlineFullscreen && !inlinePiPLayout && !inPip;
+    }
+
+    /**
+     * 页面形态变化后让插件入口重算一次，并把新形态广播给订阅者。
+     *
+     * <p>广播值取 {@link #isImmersive()} 而不是裸 {@code inlineFullscreen}：入口隐藏判据就是它，
+     * 两处取不同值会让画中画期间事件报「全屏」而入口仍可见。
+     */
+    private void refreshPluginEntrances() {
+        try {
+            PluginController.get().refreshRender(this);
+        } catch (Throwable ignored) {
+            // 插件入口是可选增强：重算失败不该影响播放页。
+        }
+        if (Util.isLeanback()) return;
+        try {
+            PluginHostEvents.playbackFullscreen(this, isImmersive());
+        } catch (Throwable ignored) {
+            // 事件是可选增强：广播失败同样不该影响播放页。
+        }
     }
 
     private void enterInlineFullscreen() {
         if (inlineFullscreen || inlinePiPLayout || isInPictureInPictureMode()) return;
         inlineFullscreen = true;
+        // 进全屏后插件入口要整批消失：先重算再继续铺布局，避免芯片在全屏布局上闪一帧。
+        refreshPluginEntrances();
         updateDetailThemeButtonVisibility();
         requestedOrientation = getRequestedOrientation();
+        // 每次进全屏都重建自动方向基线，手动旋转的覆盖到此为止。
+        inlineManualOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED;
         // playerPanel 已提升到 root 层，全屏只需铺满整个 root，不做 reparent（避免 SurfaceView 销毁重建导致黑屏）。
         applyInlinePlayerFullscreenLayout();
         binding.playerPanel.setTranslationY(0f);
@@ -10360,6 +10526,7 @@ public class TmdbDetailActivity extends PlaybackActivity implements TrackDialog.
 
     private void setInlineFullscreenOrientation() {
         if (!inlineFullscreen) return;
+        if (inlineManualOrientation != ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED) return;
         int orientation = getInlineFullscreenOrientation();
         if (getRequestedOrientation() != orientation) setRequestedOrientation(orientation);
     }
@@ -10564,6 +10731,9 @@ public class TmdbDetailActivity extends PlaybackActivity implements TrackDialog.
         boolean suppressDisplay = suppressInlineDisplayForLeanbackFusionExit();
         prepareInlinePlayerTransition();
         inlineFullscreen = false;
+        // 退全屏后把插件入口装回来。必须在 inlineFullscreen 置回 false 之后调，否则
+        // attach 仍会认为处于沉浸态而继续不挂。
+        refreshPluginEntrances();
         setInlineLock(false);
         // 恢复 root 层内嵌尺寸，不再 reparent
         applyInlinePlayerEmbeddedLayout();
@@ -10578,6 +10748,7 @@ public class TmdbDetailActivity extends PlaybackActivity implements TrackDialog.
         setRequestedOrientation(requestedOrientation);
         focusInlinePlayerPanel();
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED;
+        inlineManualOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED;
         updateDetailThemeButtonVisibility();
     }
 
@@ -10964,12 +11135,16 @@ public class TmdbDetailActivity extends PlaybackActivity implements TrackDialog.
 
     private boolean onDetailEpisodeContainerKey(View focus, KeyEvent event) {
         if (!KeyUtil.isUpKey(event) && !KeyUtil.isDownKey(event) && !KeyUtil.isLeftKey(event) && !KeyUtil.isRightKey(event)) return false;
-        if (!KeyUtil.isActionDown(event)) return true;
+        if (!KeyUtil.isActionDown(event)) {
+            pendingDetailEpisodeTarget = RecyclerView.NO_POSITION;
+            return true;
+        }
         RecyclerView.ViewHolder holder = binding.episodeContainer.findContainingViewHolder(focus);
         if (holder == null) return true;
         int position = holder.getBindingAdapterPosition();
         if (position == RecyclerView.NO_POSITION) return true;
-        return moveDetailEpisodeFocus(position, event);
+        if (event.getRepeatCount() == 0) pendingDetailEpisodeTarget = RecyclerView.NO_POSITION;
+        return moveDetailEpisodeFocus(TmdbEpisodeGridPolicy.holdBasePosition(position, pendingDetailEpisodeTarget), event);
     }
 
     private boolean isFocusInside(View focus, View parent) {
@@ -11313,17 +11488,26 @@ public class TmdbDetailActivity extends PlaybackActivity implements TrackDialog.
     @Override
     public void onPictureInPictureModeChanged(boolean isInPictureInPictureMode, @NonNull Configuration newConfig) {
         super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig);
+        inPip = isInPictureInPictureMode;
         updateDetailThemeButtonVisibility();
-        if (!isInlinePlayerMode()) return;
+        if (!isInlinePlayerMode()) {
+            // 非内嵌形态没有布局翻转，判据只随 inPip 变：这里算一次即可。
+            refreshPluginEntrances();
+            return;
+        }
         if (isInPictureInPictureMode) {
             hideInlineControls();
             hideInlineGestureOverlays();
             // 内嵌卡片状态进入 PiP（含 Android 12+ autoEnter / 手势回桌面）必须铺满窗口，
             // 否则小窗里显示的是整页缩放（卡片圆角、描边、背景图都露出来）。全屏时布局已铺满，enterInlinePiPLayout 内部自带 guard。
             enterInlinePiPLayout();
+            // 布局翻转之后才重算：isImmersive() 读 inlinePiPLayout，早算会拿到旧形态。
+            refreshPluginEntrances();
             return;
         }
         exitInlinePiPLayout();
+        // 同上：先把内嵌布局还回去，再让插件入口按终态重算。
+        refreshPluginEntrances();
         updateInlineButtons(service() != null && player() != null && !player().isEmpty() && player().isPlaying());
         updateInlineDisplayPanel();
         updateDetailThemeButtonVisibility();
@@ -11419,13 +11603,17 @@ public class TmdbDetailActivity extends PlaybackActivity implements TrackDialog.
     @Override
     protected void onResume() {
         super.onResume();
+        // PluginEpisodeContext 是全局单槽：播放页发布后本页的快照已被覆盖，而返回本页
+        // 不触发任何重新装载。不在这里认领，用户走过一次「详情页 → 播放页 → 返回详情页」，
+        // 本页的插件 chip 此后永远读不到剧集上下文。
+        republishPluginEpisodeContext();
         refreshSelectionAfterExternalPlayback();
         if (vod != null && binding.loading.getVisibility() != View.VISIBLE) revealDefaultPlaybackLoadingPage();
         scheduleBackdropSlide(BACKDROP_SLIDE_DELAY_MS);
     }
 
     private void refreshSelectionAfterExternalPlayback() {
-        if (vod == null || vod.getFlags() == null || vod.getFlags().isEmpty()) return;
+        if (playbackSelectionTouched || vod == null || vod.getFlags() == null || vod.getFlags().isEmpty()) return;
         try {
             history = History.findPlayback(getHistoryKey(), List.of(vod.getName(), getNameText()),
                     vod.getFlags(), null, sourceTitleSeasonNumber());
@@ -13389,13 +13577,15 @@ public class TmdbDetailActivity extends PlaybackActivity implements TrackDialog.
         button.setMinimumHeight(0);
         button.setInsetTop(0);
         button.setInsetBottom(0);
+        button.setInsetLeft(0);
+        button.setInsetRight(0);
         button.setMaxWidth(ResUtil.dp2px(CHIP_MAX_WIDTH_DP));
         button.setEllipsize(TextUtils.TruncateAt.MARQUEE);
         button.setMarqueeRepeatLimit(-1);
         button.setHorizontallyScrolling(true);
         button.setSingleLine(true);
         button.setTextColor(getColor(android.R.color.white));
-        button.setPadding(24, 12, 24, 12);
+        applyChipPadding(button);
         FlexboxLayout.LayoutParams params = new FlexboxLayout.LayoutParams(FlexboxLayout.LayoutParams.WRAP_CONTENT, FlexboxLayout.LayoutParams.WRAP_CONTENT);
         params.setMargins(0, 0, 12, 12);
         button.setLayoutParams(params);
@@ -13422,6 +13612,14 @@ public class TmdbDetailActivity extends PlaybackActivity implements TrackDialog.
         button.setSelected(!Util.isLeanback() || selected || focused);
         button.setStrokeWidth(focused ? focusRingWidthPx() : ResUtil.dp2px(selected ? 2 : CHIP_STROKE_DP));
         button.setStrokeColor(ColorStateList.valueOf(focused ? focusStroke() : (selected ? colors.accent : colors.line)));
+        // 描边/底色只改 MaterialShapeDrawable，不会重写 View padding（material 1.14.0 里只有
+        // setInsets/updateButtonShape/loadFromAttributes 会调动它），所以这里无需再回写内边距。
+    }
+
+    private void applyChipPadding(MaterialButton button) {
+        int horizontal = ResUtil.dp2px(CHIP_PADDING_H_DP);
+        int vertical = ResUtil.dp2px(CHIP_PADDING_V_DP);
+        button.setPadding(horizontal, vertical, horizontal, vertical);
     }
 
     private void styleMetaChips() {
