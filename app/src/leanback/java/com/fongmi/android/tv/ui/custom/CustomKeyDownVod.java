@@ -210,6 +210,12 @@ public class CustomKeyDownVod extends GestureDetector.SimpleOnGestureListener {
     public interface Listener extends SeekListener {
         void onSpeedUp();
         void onSpeedEnd();
+
+        void onSpeedStepUp();
+
+        void onSpeedStepDown();
+
+        void onShowControl();
         void onKeyUp();
         void onKeyDown();
         void onKeyCenter();
